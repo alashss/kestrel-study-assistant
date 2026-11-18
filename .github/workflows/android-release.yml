@@ -1,49 +1,110 @@
-name: Android Build and Release
+name: Kestrel Android Release
+
 on:
   push:
-    tags: [ 'v*' ]
-  workflow_dispatch:
+    tags:
+      - "v*"
 
 permissions:
   contents: write
 
 jobs:
   build:
+    name: Build APK and Publish Release
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
-      - uses: android-actions/setup-android@v3
-      - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: 8.9
-      - name: Decode signing keystore
+          java-version: "17"
+
+      - name: Setup Android SDK
+        run: |
+          set -e
+
+          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" \
+            -type f -name sdkmanager | head -n 1)
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "ERROR: Android sdkmanager not found"
+            exit 1
+          fi
+
+          echo "Using: $SDKMANAGER"
+
+          set +o pipefail
+          yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses
+          set -o pipefail
+
+          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Install Gradle 8.9
+        run: |
+          set -e
+          curl -fL \
+            https://services.gradle.org/distributions/gradle-8.9-bin.zip \
+            -o "$RUNNER_TEMP/gradle.zip"
+
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
+
+          echo "$RUNNER_TEMP/gradle-8.9/bin" >> "$GITHUB_PATH"
+
+          "$RUNNER_TEMP/gradle-8.9/bin/gradle" --version
+
+      - name: Prepare signing keystore
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
+          set -e
+
           if [ -z "$KEYSTORE_BASE64" ]; then
-            echo "ANDROID_KEYSTORE_BASE64 secret is required for a release build."
+            echo "ERROR: ANDROID_KEYSTORE_BASE64 secret is missing."
             exit 1
           fi
-          echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release.keystore"
-      - name: Build signed release APK
+
+          echo "$KEYSTORE_BASE64" | base64 --decode \
+            > "$RUNNER_TEMP/release.keystore"
+
+          test -s "$RUNNER_TEMP/release.keystore"
+
+      - name: Build signed APK
         env:
           RELEASE_STORE_FILE: ${{ runner.temp }}/release.keystore
           RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: gradle --no-daemon assembleRelease
-      - name: Upload APK to workflow
-        uses: actions/upload-artifact@v4
-        with:
-          name: kestrel-study-release-apk
-          path: app/build/outputs/apk/release/*.apk
-      - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -e
+          gradle --no-daemon clean assembleRelease
+
+          APK="app/build/outputs/apk/release/app-release.apk"
+
+          if [ ! -f "$APK" ]; then
+            echo "ERROR: APK was not generated."
+            find app/build/outputs -type f
+            exit 1
+          fi
+
+          mkdir -p release
+          cp "$APK" "release/Kestrel-${GITHUB_REF_NAME}.apk"
+
+      - name: Publish APK to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: app/build/outputs/apk/release/*.apk
+          tag_name: ${{ github.ref_name }}
+          name: Kestrel ${{ github.ref_name }}
+          body: |
+            Kestrel Study Assistant Android Release
+
+            Download the APK below and install it on your Android device.
+          files: release/*.apk
           generate_release_notes: true
+          fail_on_unmatched_files: true
